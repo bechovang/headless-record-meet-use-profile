@@ -5,10 +5,12 @@
   "private": true,
   "scripts": {
     "auth": "npx tsx auth.ts",
-    "start": "npx tsx meet.ts"
+    "start": "npx tsx meet.ts",
+    "record": "npx tsx meet.ts"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "tsx": "^4.19.0"
   },
   "peerDependencies": {
     "typescript": "^5"

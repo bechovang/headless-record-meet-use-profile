@@ -4,9 +4,29 @@ import fs from 'fs';
 
 async function run() {
     const args = process.argv.slice(2);
-    if (!args[0]) {
-        console.log('Usage: bun meet.ts <google-meet-url> [your-name] [duration-mins] [--headless]');
-        process.exit(1);
+    if (!args[0] || args.includes('--help') || args.includes('-h')) {
+        console.log(`
+Usage:
+  npx tsx meet.ts <google-meet-url> [bot-name] [duration-mins] [options]
+
+Arguments:
+  <google-meet-url>       Full Google Meet URL (required)
+  [bot-name]              Display name shown in meeting (default: "Shadow NoteTaker")
+  [duration-mins]         Max recording duration in minutes (default: 15)
+
+Options:
+  --headless              Run browser in background without UI
+  --filename <name>       Custom output filename (e.g. --filename "my-recording")
+  --no-profile            Run in incognito mode without loading saved Google profile
+  --user-data-dir <path>  Custom directory for browser profile (default: ./user_data)
+  --help, -h              Show this help message
+
+Examples:
+  npm run auth
+  npx tsx meet.ts "https://meet.google.com/abc-defg-hij" "Bot Note" 60 --headless
+  npx tsx meet.ts "https://meet.google.com/abc-defg-hij" "Bot Note" 300 --headless --filename "team-sync"
+        `);
+        process.exit(0);
     }
     const meetUrl = args[0];
     const name = args[1] && !args[1].startsWith('--') ? args[1] : 'Shadow NoteTaker';
