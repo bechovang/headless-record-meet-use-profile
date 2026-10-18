@@ -1,5 +1,6 @@
 import { chromium, type BrowserContext } from 'playwright';
 import path from 'path';
+import fs from 'fs';
 
 async function run() {
     const args = process.argv.slice(2);
@@ -24,28 +25,61 @@ async function run() {
     if (isHeadless) console.log('Running in HEADLESS mode');
 
     // Ensure recordings directory exists
-    if (!require('fs').existsSync(recordingsDir)) {
-        require('fs').mkdirSync(recordingsDir);
+    if (!fs.existsSync(recordingsDir)) {
+        fs.mkdirSync(recordingsDir);
     }
 
-    // Launch browser and create a stateless context
-    const browser = await chromium.launch({
-        headless: isHeadless,
-        args: [
-            '--use-fake-ui-for-media-stream',
-            '--disable-blink-features=AutomationControlled',
-            '--auto-select-tab-capture-source-by-title="Meet"',
-            '--enable-features=TabCapture,WebRTCPipeWireCapturer',
-            '--allow-http-screen-capture',
-            '--autoplay-policy=no-user-gesture-required',
-        ],
-        ignoreDefaultArgs: ['--enable-automation'],
-    });
+    // Support profile persistence for Google login
+    const noProfile = args.includes('--no-profile');
+    const customProfileArg = args.find(arg => arg.startsWith('--user-data-dir=') || arg.startsWith('--user-data-dir'));
+    let userDataDir = path.join(process.cwd(), 'user_data');
+    if (customProfileArg) {
+        if (customProfileArg.includes('=')) {
+            userDataDir = customProfileArg.split('=')[1];
+        } else {
+            const idx = args.indexOf(customProfileArg);
+            if (args[idx + 1] && !args[idx + 1].startsWith('--')) {
+                userDataDir = args[idx + 1];
+            }
+        }
+    }
 
-    const context = await browser.newContext({
-        permissions: ['microphone', 'camera'],
-        viewport: { width: 1280, height: 720 },
-    });
+    const browserArgs = [
+        '--use-fake-ui-for-media-stream',
+        '--disable-blink-features=AutomationControlled',
+        '--auto-select-tab-capture-source-by-title="Meet"',
+        '--enable-features=TabCapture,WebRTCPipeWireCapturer',
+        '--allow-http-screen-capture',
+        '--autoplay-policy=no-user-gesture-required',
+    ];
+
+    let browser: any = null;
+    let context: BrowserContext;
+
+    if (!noProfile) {
+        console.log(`Using persistent browser profile from: ${userDataDir}`);
+        if (!fs.existsSync(userDataDir)) {
+            fs.mkdirSync(userDataDir, { recursive: true });
+        }
+        context = await chromium.launchPersistentContext(userDataDir, {
+            headless: isHeadless,
+            viewport: { width: 1280, height: 720 },
+            permissions: ['microphone', 'camera'],
+            args: browserArgs,
+            ignoreDefaultArgs: ['--enable-automation'],
+        });
+    } else {
+        console.log('Running with stateless profile (incognito)');
+        browser = await chromium.launch({
+            headless: isHeadless,
+            args: browserArgs,
+            ignoreDefaultArgs: ['--enable-automation'],
+        });
+        context = await browser.newContext({
+            permissions: ['microphone', 'camera'],
+            viewport: { width: 1280, height: 720 },
+        });
+    }
 
     // Grant permissions for camera and microphone
     await context.grantPermissions(['camera', 'microphone'], { origin: 'https://meet.google.com' });
@@ -94,7 +128,7 @@ async function run() {
         // Clean up any empty recording file if it was created accidentally
         // (though in this version we check before creation)
         await context.close();
-        await browser.close();
+        if (browser) await browser.close();
         process.exit(1);
     }
 
@@ -128,14 +162,14 @@ async function run() {
 
     const recordingPath = path.join(recordingsDir, recordingName);
     console.log(`Recording file will be saved to: ${recordingPath}`);
-    const recordingStream = require('fs').createWriteStream(recordingPath);
+    const recordingStream = fs.createWriteStream(recordingPath);
 
     await context.exposeFunction('saveRecordingChunk', (data: any) => {
         // Playwright might send this as an object of {index: value}
         // or a Buffer/Uint8Array depending on versions. We handle both.
         const buffer = Buffer.isBuffer(data) ? data : Buffer.from(Object.values(data) as number[]);
         recordingStream.write(buffer);
-        console.log(`Saved chunk. Current file size: ${require('fs').statSync(recordingPath).size} bytes`);
+        console.log(`Saved chunk. Current file size: ${fs.statSync(recordingPath).size} bytes`);
     });
 
     const startMergedRecording = async () => {
@@ -147,23 +181,22 @@ async function run() {
             await page.click('body', { force: true });
         } catch (e) { }
 
-        await page.evaluate(async () => {
+        await page.evaluate(`(async () => {
             console.log('Browser: Starting composite stream capture...');
             try {
                 // 1. Get Video track from Tab Capture
-                // @ts-ignore
                 const displayStream = await navigator.mediaDevices.getDisplayMedia({
-                    video: { displaySurface: 'browser' } as any,
-                    // @ts-ignore
+                    video: { displaySurface: 'browser' },
                     preferCurrentTab: true,
-                    audio: false // We will handle audio via WebAudio for robustness
+                    audio: false
                 });
                 const videoTrack = displayStream.getVideoTracks()[0];
                 if (!videoTrack) throw new Error('No video track');
                 console.log('Browser: Got video track:', videoTrack.label);
 
                 // 2. Setup AudioContext to capture page audio
-                const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+                const AudioCtxClass = window.AudioContext || window.webkitAudioContext;
+                const audioCtx = new AudioCtxClass();
                 console.log('Browser: AudioContext created. State:', audioCtx.state);
 
                 if (audioCtx.state === 'suspended') {
@@ -173,59 +206,43 @@ async function run() {
 
                 const destination = audioCtx.createMediaStreamDestination();
 
-                const connectElements = () => {
+                function connectElements() {
                     const videoElements = Array.from(document.querySelectorAll('video'));
                     const audioElements = Array.from(document.querySelectorAll('audio'));
-                    const mediaElements = [...videoElements, ...audioElements];
+                    const mediaElements = videoElements.concat(audioElements);
 
-                    mediaElements.forEach(el => {
-                        // @ts-ignore
+                    mediaElements.forEach(function(el) {
                         if (el._connected) return;
 
-                        // Debug log element state
-                        // @ts-ignore
-                        console.log(`Browser: Found media element <${el.tagName}>. Muted: ${el.muted}, Volume: ${el.volume}, Paused: ${el.paused}, ReadyState: ${el.readyState}`);
+                        console.log('Browser: Found media element <' + el.tagName + '>. Muted: ' + el.muted + ', Volume: ' + el.volume + ', Paused: ' + el.paused);
 
                         try {
-                            let source;
-                            // @ts-ignore
+                            var source;
                             if (el.srcObject) {
-                                // Check if the stream actually has audio tracks
-                                // @ts-ignore
-                                const audioTracks = el.srcObject.getAudioTracks();
+                                var audioTracks = el.srcObject.getAudioTracks();
                                 if (audioTracks.length === 0) {
-                                    console.log('Browser: Element has srcObject but NO audio tracks. Skipping for now.');
                                     return;
                                 }
-
-                                console.log('Browser: Element has srcObject with audio tracks. Using createMediaStreamSource.');
-                                // @ts-ignore
                                 source = audioCtx.createMediaStreamSource(el.srcObject);
                             } else if (el.src && el.src !== '') {
-                                console.log('Browser: Element has src URL. Using createMediaElementSource.');
                                 source = audioCtx.createMediaElementSource(el);
                             } else {
-                                console.log('Browser: Element has no valid source yet. Skipping.');
                                 return;
                             }
 
-                            // Connect to Destination (for recording)
-                            source.connect(destination); // To Recording
-
-                            // @ts-ignore
+                            source.connect(destination);
                             el._connected = true;
                             console.log('Browser: Successfully connected audio from', el.tagName);
                         } catch (e) {
                             console.warn('Browser: Failed to connect source:', e);
                         }
                     });
-                };
+                }
 
                 connectElements();
-                const checkInterval = setInterval(connectElements, 3000); // Check more frequently initially
+                const checkInterval = setInterval(connectElements, 3000);
 
                 // 3. Combine tracks into a new stream
-                // @ts-ignore
                 const compositeStream = new MediaStream([videoTrack]);
                 const audioTracks = destination.stream.getAudioTracks();
                 if (audioTracks[0]) {
@@ -237,16 +254,15 @@ async function run() {
                     mimeType: 'video/webm'
                 });
 
-                mediaRecorder.ondataavailable = async (e: BlobEvent) => {
+                mediaRecorder.ondataavailable = async function(e) {
                     if (e.data.size > 0) {
                         const buffer = await e.data.arrayBuffer();
-                        // @ts-ignore
                         window.saveRecordingChunk(new Uint8Array(buffer));
                     }
                 };
 
-                mediaRecorder.onstart = () => console.log('Browser: MediaRecorder started (Composite)');
-                mediaRecorder.onstop = () => {
+                mediaRecorder.onstart = function() { console.log('Browser: MediaRecorder started (Composite)'); };
+                mediaRecorder.onstop = function() {
                     console.log('Browser: MediaRecorder stopped');
                     clearInterval(checkInterval);
                     audioCtx.close();
@@ -254,15 +270,12 @@ async function run() {
 
                 mediaRecorder.start(1000);
 
-                // Storage for cleanup
-                // @ts-ignore
                 window._mediaRecorder = mediaRecorder;
-                // @ts-ignore
                 window._recordingStream = compositeStream;
             } catch (err) {
                 console.error('Browser: Failed composite recording:', err);
             }
-        });
+        })()`);
     };
 
     console.log('Waiting for meeting room to be ready...');
@@ -327,19 +340,24 @@ async function run() {
         }
 
         // Find and click join button
-
         const selectors = [
             'span:has-text("Join now")',
             'span:has-text("Ask to join")',
             'button:has-text("Join now")',
             'button:has-text("Ask to join")',
-            '[aria-label="Join now"]'
+            '[aria-label="Join now"]',
+            'span:has-text("Tham gia ngay")',
+            'span:has-text("Yêu cầu tham gia")',
+            'button:has-text("Tham gia ngay")',
+            'button:has-text("Yêu cầu tham gia")',
+            '[aria-label*="Tham gia"]',
+            '[aria-label*="Join"]'
         ];
 
         for (const selector of selectors) {
             try {
                 const button = page.locator(selector).first();
-                if (await button.isVisible({ timeout: 2000 })) {
+                if (await button.isVisible({ timeout: 1000 })) {
                     await button.click();
                     console.log(`Clicked join button using selector: ${selector}`);
                     return true;
@@ -474,7 +492,7 @@ async function run() {
 
         recordingStream.end();
         await context.close();
-        await browser.close();
+        if (browser) await browser.close();
         console.log('Browser closed and recordings saved.');
         process.exit(0);
     };
