@@ -300,25 +300,61 @@ Examples:
 
     console.log('Waiting for meeting room to be ready...');
 
-
-    // Function to click join button if found
-    const attemptJoin = async () => {
-        // First, try to dismiss any overlays (like microphone/camera blocked popups)
+    // Function to dismiss any overlays or promo popups (pre-meeting or in-meeting)
+    const dismissAllOverlays = async () => {
         const dismissSelectors = [
-            'button:has-text("Dismiss")',
             'button:has-text("Got it")',
-            'button:has-text("OK")'
+            'button:has-text("Dismiss")',
+            'button:has-text("OK")',
+            'button:has-text("Close")',
+            'button:has-text("Đã hiểu")',
+            'button:has-text("Bỏ qua")',
+            'button:has-text("Đóng")',
+            '[aria-label="Close"]',
+            '[aria-label="Đóng"]',
+            '[aria-label*="Dismiss"]',
+            '[aria-label*="Got it"]',
+            '[aria-label*="Đã hiểu"]'
         ];
 
         for (const selector of dismissSelectors) {
             try {
                 const btn = page.locator(selector).first();
-                if (await btn.isVisible({ timeout: 500 })) {
+                if (await btn.isVisible({ timeout: 300 })) {
                     await btn.click();
-                    console.log(`Dismissed overlay using selector: ${selector}`);
+                    console.log(`[Overlay] Dismissed popup using selector: ${selector}`);
                 }
             } catch (e) { }
         }
+
+        // Also clean up any lingering modal overlays / promo backdrops directly from DOM
+        try {
+            await page.evaluate(() => {
+                const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], .modal, div[data-promo-anchor-id]');
+                dialogs.forEach((dialog: any) => {
+                    const text = dialog.innerText || '';
+                    if (text.includes('Others may see your video differently') ||
+                        text.includes('Người khác có thể thấy khung hình camera') ||
+                        text.includes('self view') ||
+                        text.includes('Got it') ||
+                        text.includes('Đã hiểu')) {
+                        // Look for a button inside
+                        const btn = dialog.querySelector('button');
+                        if (btn) {
+                            btn.click();
+                        } else {
+                            dialog.remove();
+                        }
+                    }
+                });
+            });
+        } catch (e) { }
+    };
+
+    // Function to click join button if found
+    const attemptJoin = async () => {
+        // First, try to dismiss any overlays (like microphone/camera blocked popups)
+        await dismissAllOverlays();
 
         // Second, ensure mic and camera are off before joining
         try {
@@ -451,6 +487,12 @@ Examples:
         }
 
         console.log('Bot has been admitted to the meeting.');
+
+        // Dismiss any post-join tip popups (like "Others may see your video differently")
+        await page.waitForTimeout(1500);
+        await dismissAllOverlays();
+        await page.waitForTimeout(500);
+
         await startMergedRecording();
         console.log('Audio and Video recording initialized.');
     } catch (e) {
@@ -519,6 +561,9 @@ Examples:
 
     const monitoringInterval = setInterval(async () => {
         try {
+            // Continuously dismiss any random tip popups / dialog overlays that appear during meeting
+            await dismissAllOverlays();
+
             // Check if bot has been kicked from the meeting
             const isKicked = await page.evaluate(() => {
                 // Method 1: Check for "Return to home screen" button (appears when kicked)
